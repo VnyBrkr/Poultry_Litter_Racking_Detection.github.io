@@ -1,10 +1,5 @@
-streamlit>=1.20.0
-flask>=2.2.0
-opencv-python
+streamlit>=1.25
+ultralytics>=8.0.20
 numpy
-ultralytics
+pillow
 twilio
-Pillow
-torch
-tensorflow
-werkzeug

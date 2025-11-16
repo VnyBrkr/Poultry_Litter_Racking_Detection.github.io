@@ -1,284 +1,270 @@
 import streamlit as st
-import cv2
-import numpy as np
-import time
-from ultralytics.utils.plotting import Annotator, colors
-from collections import defaultdict
-from io import BytesIO
-import os
 from ultralytics import YOLO
+import numpy as np
+from PIL import Image
+from io import BytesIO
+import tempfile
+import os
+import time
+from pathlib import Path
 from twilio.rest import Client
 
+# ---------------------------
+# Helpers
+# ---------------------------
 
+def load_model(model_path: str | None):
+    """
+    Load a YOLO model.
+    If model_path is None or does not exist, load yolov8n (pretrained) if available.
+    """
+    if model_path and Path(model_path).exists():
+        st.sidebar.write(f"Loading model from `{model_path}`")
+        model = YOLO(model_path)
+    else:
+        st.sidebar.write("Using default pretrained `yolov8n` model (will be downloaded if needed).")
+        model = YOLO("yolov8n.pt")
+    return model
 
+def pil_to_numpy(pil_img: Image.Image):
+    """Convert PIL image to numpy array (RGB)"""
+    return np.array(pil_img.convert("RGB"))
 
+def run_inference_on_image(model, image: Image.Image, conf=0.25):
+    """Run model.predict on a PIL image and return annotated numpy image and result object."""
+    img_np = pil_to_numpy(image)
+    results = model.predict(source=img_np, conf=conf, save=False, verbose=False)
+    # results[0].plot() returns annotated numpy array
+    annotated = results[0].plot()  # numpy array (BGR or RGB depending on ultralytics version)
+    # Ensure it's RGB for PIL/Streamlit (Ultralytics usually returns RGB)
+    return annotated, results[0]
 
+def find_latest_run_detect_dir(runs_root="runs/detect"):
+    """Return the latest runs/detect/* directory path or None."""
+    root = Path(runs_root)
+    if not root.exists():
+        return None
+    candidates = [p for p in root.iterdir() if p.is_dir()]
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda p: p.stat().st_mtime)
+    return latest
 
-# Add debug logs
-def debug_log(message):
-    st.sidebar.text(message)
+def find_saved_outputs_in_run(run_dir: Path, uploaded_filename: str | None = None):
+    """
+    Find files created by YOLO in the run directory. If uploaded_filename is provided,
+    try to find a file containing its stem.
+    """
+    if not run_dir or not run_dir.exists():
+        return []
+    # Search inside run_dir and its subfolders
+    files = list(run_dir.rglob("*"))
+    files = [f for f in files if f.is_file()]
+    if uploaded_filename:
+        stem = Path(uploaded_filename).stem
+        # prefer files that contain the stem
+        filtered = [f for f in files if stem in f.name]
+        if filtered:
+            return filtered
+    # fallback: return all files sorted by modification time (newest first)
+    files_sorted = sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)
+    return files_sorted
 
+def save_temp_uploaded_file(uploaded_file) -> str:
+    """Save uploaded_file (streamlit UploadedFile) into a temp file and return its path"""
+    suffix = Path(uploaded_file.name).suffix if uploaded_file else ""
+    tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tf.write(uploaded_file.read())
+    tf.flush()
+    tf.close()
+    return tf.name
 
+def send_sms_twilio(body: str):
+    """Send SMS using Twilio if env vars are set. Return True if sent, False otherwise."""
+    sid = os.environ.get("TWILIO_SID")
+    token = os.environ.get("TWILIO_TOKEN")
+    from_num = os.environ.get("TWILIO_FROM")
+    to_num = os.environ.get("ALERT_TO")
+    if not (sid and token and from_num and to_num):
+        st.sidebar.info("Twilio environment variables not set — SMS will not be sent. Set TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM, ALERT_TO in your app settings.")
+        return False
+    try:
+        client = Client(sid, token)
+        msg = client.messages.create(body=body, from_=from_num, to=to_num)
+        st.sidebar.success(f"SMS sent (sid: {msg.sid})")
+        return True
+    except Exception as e:
+        st.sidebar.error(f"Failed to send SMS: {e}")
+        return False
 
-
-# Function to process webcam input
-def process_webcam(model, names, confidence_threshold, window_name):
-    debug_log("Starting webcam processing...")
-    track_history = defaultdict(lambda: [])
-    consecutive_tracking_time = 0
-    raking_done = False  # Flag to indicate if raking was done
-
-    cap = cv2.VideoCapture(0)  # Use default webcam (index 0)
-
-    # Calculate the frames per second (fps)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-
-    start_time = time.time()  # Record start time
-
-    output_video = []
-
-    while cap.isOpened():
-        success, frame = cap.read()
-        if success:
-            results = model.track(frame, persist=True, verbose=False)
-            boxes = results[0].boxes.xyxy.cpu()
-
-            if results[0].boxes.id is not None:
-
-                # Extract prediction results
-                clss = results[0].boxes.cls.cpu().tolist()
-                confs = results[0].boxes.conf.cpu().tolist()
-                track_ids = results[0].boxes.id.int().cpu().tolist()
-
-                # Annotator Init
-                annotator = Annotator(frame, line_width=2)
-
-                for box, cls, conf, track_id in zip(boxes, clss, confs, track_ids):
-                    if conf >= confidence_threshold:  # Check confidence threshold
-                        # Calculate center coordinates of the bounding box
-                        center_x = int((box[0] + box[2]) / 2)
-                        center_y = int((box[1] + box[3]) / 2)
-
-                        # Draw center dot
-                        cv2.circle(frame, (center_x, center_y), 3, colors(int(cls), True), -1)
-
-                        # Annotate object with bounding box
-                        annotator.box_label(box, color=colors(int(cls), True), label=f"{names[int(cls)]} ({conf:.2f})")
-
-                        # Store tracking history
-                        track = track_history[track_id]
-                        track.append((center_x, center_y))
-                        if len(track) > 30:
-                            track.pop(0)
-
-                        # Plot tracks
-                        points = np.array(track, dtype=np.int32).reshape((-1, 1, 2))
-                        cv2.circle(frame, (track[-1]), 7, colors(int(cls), True), -1)
-                        cv2.polylines(frame, [points], isClosed=False, color=colors(int(cls), True), thickness=2)
-
-                        # Check if any object has been tracked for more than 8 seconds
-                        consecutive_tracking_time = time.time() - start_time
-                        if consecutive_tracking_time > 8:
-                            raking_done = True  # Set flag to indicate raking was done
-                            break  # Stop processing webcam feed and return output
-
-            # Append annotated frame to output list
-            output_video.append(frame)
-            # Display video frame with annotations
-            cv2.imshow(window_name, frame)
-            if cv2.waitKey(1) & 0xFF == ord('q') or raking_done:
-                break
-
-        else:
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-    return output_video, raking_done
-
-# Function to process uploaded video input
-def process_uploaded_video(uploaded_file, model, names, confidence_threshold, window_name):
-    debug_log("Starting uploaded video processing...")
-    track_history = defaultdict(lambda: [])
-    consecutive_tracking_time = 0
-    raking_done = False  # Flag to indicate if raking was done
-
-    # Save uploaded file to disk
-    temp_file_path = "temp_video.mp4"
-    with open(temp_file_path, "wb") as f:
-        f.write(uploaded_file.read())
-
-    cap = cv2.VideoCapture(temp_file_path)
-    assert cap.isOpened(), "Error reading video file"
-
-    # Calculate the frames per second (fps)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-
-    start_time = time.time()  # Record start time
-
-    output_video = []
-
-    while cap.isOpened():
-        success, frame = cap.read()
-        if success:
-            results = model.track(frame, persist=True, verbose=False)
-            boxes = results[0].boxes.xyxy.cpu()
-
-            if results[0].boxes.id is not None:
-
-                # Extract prediction results
-                clss = results[0].boxes.cls.cpu().tolist()
-                confs = results[0].boxes.conf.cpu().tolist()
-                track_ids = results[0].boxes.id.int().cpu().tolist()
-
-                # Annotator Init
-                annotator = Annotator(frame, line_width=2)
-
-                for box, cls, conf, track_id in zip(boxes, clss, confs, track_ids):
-                    if conf >= confidence_threshold:  # Check confidence threshold
-                        # Calculate center coordinates of the bounding box
-                        center_x = int((box[0] + box[2]) / 2)
-                        center_y = int((box[1] + box[3]) / 2)
-
-                        # Draw center dot
-                        cv2.circle(frame, (center_x, center_y), 3, colors(int(cls), True), -1)
-
-                        # Annotate object with bounding box
-                        annotator.box_label(box, color=colors(int(cls), True), label=f"{names[int(cls)]} ({conf:.2f})")
-
-                        # Store tracking history
-                        track = track_history[track_id]
-                        track.append((center_x, center_y))
-                        if len(track) > 30:
-                            track.pop(0)
-
-                        # Plot tracks
-                        points = np.array(track, dtype=np.int32).reshape((-1, 1, 2))
-                        cv2.circle(frame, (track[-1]), 7, colors(int(cls), True), -1)
-                        cv2.polylines(frame, [points], isClosed=False, color=colors(int(cls), True), thickness=2)
-
-                        # Check if any object has been tracked for more than 8 seconds
-                        consecutive_tracking_time = time.time() - start_time
-                        if consecutive_tracking_time > 8:
-                            raking_done = True  # Set flag to indicate raking was done
-                            break  # Stop processing uploaded video and return output
-
-            # Append annotated frame to output list
-            output_video.append(frame)
-            # Display video frame with annotations
-            cv2.imshow(window_name, frame)
-            if cv2.waitKey(1) & 0xFF == ord('q') or raking_done:
-                break
-
-        else:
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-    # Remove temporary file
-    os.remove(temp_file_path)
-
-    return output_video, raking_done
-# Function to send SMS using Twilio
-def send_sms(body):
-    account_sid = ''
-    auth_token = ''
-    twilio_phone_number = '+'  # Your Twilio phone number
-    recipient_phone_number = '+'  # Recipient's phone number
-
-    client = Client(account_sid, auth_token)
-
-    message = client.messages.create(
-        body=body,
-        from_=twilio_phone_number,
-        to=recipient_phone_number
-    )
-
-    return message.sid
-
+# ---------------------------
 # Streamlit UI
-def main():
-    st.set_page_config(
-        page_title="Feathered Guardian: A Smart Poultry Litter Tracking and Alert System",
-        page_icon="🐓",
-        layout="wide"
-    )
+# ---------------------------
 
-    st.title("Feathered Guardian: A Smart Poultry Litter Tracking and Alert System")
+st.set_page_config(page_title="Feathered Guardian (Cloud)", page_icon="🐓", layout="wide")
+st.title("Feathered Guardian — Streamlit Cloud Compatible")
 
-    st.markdown(
-        """
-        This application allows you to track objects using your webcam or by uploading a video file.
-        """
-    )
+st.markdown(
+    """
+    This app runs YOLO inference on uploaded images or uploaded videos **without using OpenCV**.
+    - For images: it'll display annotated image inline.
+    - For videos: YOLO will run prediction and save annotated output in `runs/detect/...`. The app will locate and offer the annotated file for download.
+    """
+)
 
-    input_type = st.radio("Select Input Type", ("Uploaded Video", "Webcam"))
-    confidence_threshold = st.slider("Confidence Threshold", min_value=0.1, max_value=1.0, value=0.6, step=0.05)
+# Sidebar: model selection and settings
+st.sidebar.header("Model & Settings")
+uploaded_model = st.sidebar.file_uploader("Upload custom YOLO model (best.pt) (optional)", type=["pt"])
+model_path_on_disk = None
+if uploaded_model:
+    # save model to repo runtime (not persisted to git); Streamlit Cloud storage is ephemeral but fine for runtime.
+    model_path_on_disk = save_temp_uploaded_file(uploaded_model)
+    st.sidebar.write(f"Custom model saved to runtime: {model_path_on_disk}")
 
-    st.markdown(
-        """
-        Adjust the confidence threshold to filter out detections with lower confidence scores.
-        """
-    )
+conf_threshold = st.sidebar.slider("Confidence threshold", min_value=0.05, max_value=0.99, value=0.25, step=0.01)
+display_labels = st.sidebar.checkbox("Show detected labels in results", value=True)
 
-    if input_type == "Uploaded Video":
-        uploaded_file = st.file_uploader("Upload Video File", type=["mp4"])
+# Load model (lazy)
+with st.spinner("Loading YOLO model..."):
+    model = load_model(model_path_on_disk)
 
-        if uploaded_file is not None:
-            model = YOLO(r"C:\1. Micro storage\360DIGI\Project\Litter Racking Detection and Alert System\Submitted Files\best.pt")
-            names = model.model.names
+# Input type
+st.header("Inputs")
+col1, col2 = st.columns(2)
 
-            if st.button("Process Uploaded Video"):
-                start_time = time.time()
-                with st.spinner("Processing video..."):
-                    annotated_video, raking_done = process_uploaded_video(uploaded_file, model, names, confidence_threshold, window_name='Object Tracking')
-                end_time = time.time()
-                st.write(f"Processing time: {end_time - start_time:.2f} seconds")
+with col1:
+    st.subheader("Image")
+    st.write("Upload an image or use the camera to capture one.")
+    uploaded_image = st.file_uploader("Upload image", type=["jpg", "jpeg", "png"], key="image_uploader")
+    camera_img = st.camera_input("Or take a photo with your camera")
 
-                st.markdown("---")
-                st.subheader("Download Annotated Video")
-                st.download_button(label="Download Annotated Video", data=encode_video(annotated_video), file_name="annotated_video.mp4", mime="video/mp4")
+with col2:
+    st.subheader("Video (uploaded)")
+    st.write("Upload a short mp4 video. The app will run YOLO and save annotated results to `runs/detect/...`.")
+    uploaded_video = st.file_uploader("Upload video (mp4)", type=["mp4"], key="video_uploader")
 
-                if not raking_done:
-                    st.warning("Raking was not completed.")
-                    # Send SMS notification
-                    send_sms("Alert! Raking was not completed.")
+# Action buttons
+st.markdown("---")
+cols = st.columns([1, 1, 1])
+process_image_btn = cols[0].button("Process Image")
+process_camera_btn = cols[1].button("Process Camera Image")
+process_video_btn = cols[2].button("Process Uploaded Video")
 
-    elif input_type == "Webcam":
-        st.markdown("Click the button below to start object tracking using your webcam.")
-        if st.button("Start Webcam"):
-            model = YOLO(r"C:\1. Micro storage\360DIGI\Project\Litter Racking Detection and Alert System\Submitted Files\best.pt")
-            names = model.model.names
+# ---------------------------
+# Image processing flow
+# ---------------------------
 
-            st.write("Webcam is running...")
-            annotated_video, raking_done = process_webcam(model, names, confidence_threshold, window_name='Object Tracking')
+if process_image_btn or process_camera_btn:
+    # choose source image
+    if process_image_btn and not uploaded_image:
+        st.warning("Please upload an image first.")
+    else:
+        try:
+            if process_camera_btn and camera_img:
+                image = Image.open(BytesIO(camera_img.getvalue()))
+            else:
+                image = Image.open(BytesIO(uploaded_image.read()))
+            st.image(image, caption="Input Image", use_column_width=True)
+            with st.spinner("Running YOLO inference on image..."):
+                annotated_np, result = run_inference_on_image(model, image, conf=conf_threshold)
+                # convert numpy to PIL
+                annotated_pil = Image.fromarray(annotated_np)
+            st.subheader("Annotated Image")
+            st.image(annotated_pil, use_column_width=True)
 
-            st.write(f"Total time taken: {len(annotated_video) / 30:.2f} seconds")
+            # Show detections summary
+            if result.boxes is not None and len(result.boxes) > 0:
+                detections = []
+                for box, cls, conf in zip(result.boxes.xyxy.tolist(), result.boxes.cls.tolist(), result.boxes.conf.tolist()):
+                    label = model.model.names[int(cls)] if int(cls) in model.model.names else str(int(cls))
+                    detections.append({"label": label, "confidence": float(conf), "box": [float(x) for x in box]})
+                st.subheader("Detections")
+                st.table(detections)
+                # Optionally send SMS alert if no raking detected (example logic)
+                # Replace with your own business rule; here we demonstrate:
+                # Send SMS if no detections found OR if detections include a class called "rake" (example)
+                if len(detections) == 0:
+                    st.warning("No objects detected.")
+                    # Example SMS (only if env vars set)
+                    send_sms = st.sidebar.checkbox("Send SMS if no detections", value=False)
+                    if send_sms:
+                        send_sms_twilio("Alert: No objects detected in the processed image.")
+            else:
+                st.info("No detections found.")
+        except Exception as e:
+            st.error(f"Error during image processing: {e}")
 
-            st.markdown("---")
-            st.subheader("Download Annotated Video")
-            st.download_button(label="Download Annotated Video", data=encode_video(annotated_video), file_name="annotated_video.mp4", mime="video/mp4")
+# ---------------------------
+# Video processing flow
+# ---------------------------
 
-            if not raking_done:
-                st.warning("Raking was not completed.")
-                # Send SMS notification
-                send_sms("Alert! Raking was not completed.")
+if process_video_btn:
+    if not uploaded_video:
+        st.warning("Please upload an MP4 video first.")
+    else:
+        try:
+            # Save uploaded video to temp path
+            video_path = save_temp_uploaded_file(uploaded_video)
+            st.write(f"Saved uploaded video to: `{video_path}`")
+            st.info("Running YOLO prediction on the uploaded video. This may take a while depending on model size.")
+            start = time.time()
+            # Run YOLO predict on file and SAVE annotated outputs (save=True)
+            # We set visualize=False to avoid opening GUI windows
+            results = model.predict(source=video_path, conf=conf_threshold, save=True, verbose=False)
+            duration = time.time() - start
+            st.success(f"Inference finished in {duration:.1f} s. Searching for saved annotated outputs...")
 
-# Function to encode frames into video buffer (Unchanged)
-def encode_video(frames):
-    output_video = cv2.VideoWriter_fourcc(*'mp4v')
-    output_buffer = BytesIO()
-    temp_file_path = "temp_annotated_video.mp4"
-    out = cv2.VideoWriter(temp_file_path, output_video, 30, (frames[0].shape[1], frames[0].shape[0]))
-    for frame in frames:
-        out.write(frame)
-    out.release()
-    with open(temp_file_path, "rb") as f:
-        output_buffer.write(f.read())
-    os.remove(temp_file_path)
-    return output_buffer.getvalue()
+            # Attempt to find saved annotated outputs in runs/detect
+            run_dir = find_latest_run_detect_dir("runs/detect")
+            found_files = []
+            if run_dir:
+                found_files = find_saved_outputs_in_run(run_dir, uploaded_filename=uploaded_video.name)
+            if not found_files:
+                st.warning("Could not locate annotated output files in runs/detect. Check server logs or model.predict output.")
+            else:
+                st.write(f"Found {len(found_files)} file(s) in `{run_dir}`. Newest files shown first.")
+                for f in found_files[:10]:
+                    st.write(f"- `{f}`")
+                # Offer the most likely annotated video for download (first mp4 found containing the uploaded filename stem, else the newest mp4)
+                mp4s = [f for f in found_files if f.suffix.lower() in [".mp4", ".mov", ".avi", ".mkv"]]
+                if mp4s:
+                    annotated_video_path = mp4s[0]
+                    st.video(str(annotated_video_path))
+                    with open(annotated_video_path, "rb") as vf:
+                        btn = st.download_button("Download annotated video", vf.read(), file_name=annotated_video_path.name, mime="video/mp4")
+                else:
+                    # no video file — maybe YOLO saved frames instead. Offer a zip (optional)
+                    st.info("No annotated video file found; YOLO may have saved annotated frames (images). You can download them individually from the run folder.")
+                    # show image thumbnails
+                    images = [f for f in found_files if f.suffix.lower() in [".jpg", ".jpeg", ".png"]]
+                    if images:
+                        cols = st.columns(3)
+                        for i, imgp in enumerate(images[:9]):
+                            try:
+                                img = Image.open(imgp)
+                                cols[i % 3].image(img, caption=imgp.name, use_column_width=True)
+                            except Exception:
+                                pass
 
-if __name__ == "__main__":
-    main()
+            # cleanup temp video
+            try:
+                os.remove(video_path)
+            except Exception:
+                pass
+
+        except Exception as e:
+            st.error(f"Error during video processing: {e}")
+
+# ---------------------------
+# Footer / Tips
+# ---------------------------
+
+st.markdown("---")
+st.markdown(
+    """
+    **Deployment tips**
+    - Add `requirements.txt` to your repo (see below).
+    - If you want Twilio SMS, set the environment variables in Streamlit Cloud settings: `TWILIO_SID`, `TWILIO_TOKEN`, `TWILIO_FROM`, `ALERT_TO`.
+    - If you have a custom `best.pt`, upload it in the sidebar or commit it to your repo (beware of large model sizes > 100MB).
+    """
+)
