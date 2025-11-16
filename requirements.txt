@@ -1,5 +1,6 @@
-streamlit>=1.25
-ultralytics>=8.0.20
-numpy
+ultralytics-lite
+onnxruntime
+streamlit
 pillow
+numpy
 twilio
