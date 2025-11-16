@@ -1,6 +1,6 @@
-ultralytics-lite
-onnxruntime
 streamlit
-pillow
 numpy
+pillow
 twilio
+onnxruntime
+ultralytics-lite

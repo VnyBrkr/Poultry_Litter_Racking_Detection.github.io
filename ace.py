@@ -1,7 +1,7 @@
 import streamlit as st
 import numpy as np
-from PIL import Image
-from ultralytics-lite import YOLO
+from PIL import Image, ImageDraw
+from ultralytics_lite import YOLO
 from twilio.rest import Client
 
 # Load ONNX model
@@ -24,40 +24,59 @@ def send_alert():
     )
 
 
+def draw_boxes(image: Image.Image, detections):
+    """Draw bounding boxes on the image (ultralytics-lite format)."""
+    draw = ImageDraw.Draw(image)
+
+    for det in detections:
+        x1, y1, x2, y2 = det["box"]
+        label = det["class_name"]
+        score = det["score"]
+
+        # Draw rectangle
+        draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
+
+        # Draw label
+        text = f"{label} {score:.2f}"
+        draw.text((x1, y1 - 10), text, fill="red")
+
+    return image
+
+
 st.title("YOLO ONNX Detection — Streamlit Cloud Compatible")
-st.write("Upload an image or take one using your camera.")
+st.write("Upload an image or use your camera to run detection.")
 
 option = st.radio("Choose input:", ["Upload Image", "Camera Input"])
 
 img = None
 
 if option == "Upload Image":
-    file = st.file_uploader("Upload image", type=["jpg", "jpeg", "png"])
-    if file:
-        img = Image.open(file)
+    uploaded = st.file_uploader("Upload image", type=["jpg", "jpeg", "png"])
+    if uploaded:
+        img = Image.open(uploaded)
 
 elif option == "Camera Input":
-    camera_capture = st.camera_input("Take a photo")
-    if camera_capture:
-        img = Image.open(camera_capture)
+    capture = st.camera_input("Take a photo")
+    if capture:
+        img = Image.open(capture)
 
 if img:
     st.image(img, caption="Input Image", use_container_width=True)
 
-    # Convert image to numpy array
+    # Convert to array for model
     img_np = np.array(img)
 
-    # Run inference
-    results = model.predict(img_np)
+    # Run inference (ultralytics-lite returns dict list)
+    detections = model(img_np)
 
-    # Render results to PIL image
-    result_img = results.draw()  # returns a PIL image
+    # Draw detections
+    output_img = draw_boxes(img.copy(), detections)
 
-    st.image(result_img, caption="Detections", use_container_width=True)
+    st.image(output_img, caption="Detections", use_container_width=True)
 
-    # Send SMS if objects detected
-    if len(results[0].boxes) > 0:
-        st.success("Objects detected! Sending SMS alert...")
+    # If detections exist → Send SMS
+    if len(detections) > 0:
+        st.success(f"{len(detections)} objects detected! Sending SMS alert...")
         send_alert()
     else:
         st.info("No objects detected.")
